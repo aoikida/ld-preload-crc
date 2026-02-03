@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <netdb.h>
+#include <sys/uio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -163,6 +164,9 @@ using recv_fn = ssize_t (*)(int, void *, size_t, int);
 using write_fn = ssize_t (*)(int, const void *, size_t);
 using read_fn = ssize_t (*)(int, void *, size_t);
 using writev_fn = ssize_t (*)(int, const struct iovec *, int);
+using readv_fn = ssize_t (*)(int, const struct iovec *, int);
+using sendmsg_fn = ssize_t (*)(int, const struct msghdr *, int);
+using recvmsg_fn = ssize_t (*)(int, struct msghdr *, int);
 using close_fn = int (*)(int);
 
 connect_fn real_connect = nullptr;
@@ -171,6 +175,9 @@ recv_fn real_recv = nullptr;
 write_fn real_write = nullptr;
 read_fn real_read = nullptr;
 writev_fn real_writev = nullptr;
+readv_fn real_readv = nullptr;
+sendmsg_fn real_sendmsg = nullptr;
+recvmsg_fn real_recvmsg = nullptr;
 close_fn real_close = nullptr;
 
 void init_real_fns() {
@@ -180,6 +187,9 @@ void init_real_fns() {
     real_write = reinterpret_cast<write_fn>(dlsym(RTLD_NEXT, "write"));
     real_read = reinterpret_cast<read_fn>(dlsym(RTLD_NEXT, "read"));
     real_writev = reinterpret_cast<writev_fn>(dlsym(RTLD_NEXT, "writev"));
+    real_readv = reinterpret_cast<readv_fn>(dlsym(RTLD_NEXT, "readv"));
+    real_sendmsg = reinterpret_cast<sendmsg_fn>(dlsym(RTLD_NEXT, "sendmsg"));
+    real_recvmsg = reinterpret_cast<recvmsg_fn>(dlsym(RTLD_NEXT, "recvmsg"));
     real_close = reinterpret_cast<close_fn>(dlsym(RTLD_NEXT, "close"));
 }
 
@@ -760,6 +770,57 @@ extern "C" ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     ssize_t rc = handle_send(fd, flat.data(), flat.size(), 0);
     if (rc < 0) return rc;
     return static_cast<ssize_t>(total);
+}
+
+extern "C" ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+    if (!real_readv) init_real_fns();
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+    std::vector<uint8_t> flat(total);
+    ssize_t rc = handle_recv(fd, flat.data(), flat.size(), 0);
+    if (rc <= 0) return rc;
+    size_t copied = 0;
+    for (int i = 0; i < iovcnt && copied < static_cast<size_t>(rc); ++i) {
+        size_t take = std::min(static_cast<size_t>(rc) - copied, iov[i].iov_len);
+        std::memcpy(iov[i].iov_base, flat.data() + copied, take);
+        copied += take;
+    }
+    return rc;
+}
+
+extern "C" ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
+    if (!real_sendmsg) init_real_fns();
+    if (!msg) return real_sendmsg(fd, msg, flags);
+    std::vector<uint8_t> flat;
+    size_t total = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+        total += msg->msg_iov[i].iov_len;
+    }
+    flat.reserve(total);
+    for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+        const uint8_t *p = reinterpret_cast<const uint8_t *>(msg->msg_iov[i].iov_base);
+        flat.insert(flat.end(), p, p + msg->msg_iov[i].iov_len);
+    }
+    return handle_send(fd, flat.data(), flat.size(), flags);
+}
+
+extern "C" ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
+    if (!real_recvmsg) init_real_fns();
+    if (!msg) return real_recvmsg(fd, msg, flags);
+    size_t total = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; ++i) {
+        total += msg->msg_iov[i].iov_len;
+    }
+    std::vector<uint8_t> flat(total);
+    ssize_t rc = handle_recv(fd, flat.data(), flat.size(), flags);
+    if (rc <= 0) return rc;
+    size_t copied = 0;
+    for (size_t i = 0; i < msg->msg_iovlen && copied < static_cast<size_t>(rc); ++i) {
+        size_t take = std::min(static_cast<size_t>(rc) - copied, msg->msg_iov[i].iov_len);
+        std::memcpy(msg->msg_iov[i].iov_base, flat.data() + copied, take);
+        copied += take;
+    }
+    return rc;
 }
 
 extern "C" int close(int fd) {
